@@ -1,0 +1,15 @@
+# 录播助手 (LuboStudio)；Python 3.10，Windows x64 实测版本
+# 另需 ffmpeg/ffprobe（含 h264_nvenc），放在 PATH 或程序目录的 bin\ 下。
+#
+# CUDA 用户可先安装与显卡驱动匹配的 PyTorch；无显卡时可使用 CPU 版本。
+
+PySide6==6.11.2
+funasr==1.4.16
+modelscope==1.40.1
+modelscope-hub==0.4.5
+numpy==2.2.6
+torch==2.14.0
+torchaudio==2.11.0
+
+# Windows exe 打包
+pyinstaller==6.22.3

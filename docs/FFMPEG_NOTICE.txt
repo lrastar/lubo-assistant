@@ -1,0 +1,11 @@
+本软件使用 FFmpeg 和 FFprobe 命令行程序处理视频。
+
+打包脚本复制构建机器上安装的 FFmpeg 二进制文件，并把该发行版的
+LICENSE（以及存在时的 README.txt）一同放在本目录。不同 FFmpeg 构建
+可能适用 LGPL 或 GPL，具体以打包时所选发行版的许可文件为准。
+
+FFmpeg 项目：https://ffmpeg.org/
+许可与分发说明：https://ffmpeg.org/legal.html
+
+如要对外分发整个程序目录，请先核对所捆绑 FFmpeg 构建的实际许可条款，
+并按条款提供与该二进制对应的源代码和构建信息。本地自用不涉及对外分发。
