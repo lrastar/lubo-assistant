@@ -79,8 +79,10 @@ class Qwen3Adapter(QualityAsrAdapter):
 
         job = self.job
         processor, model, torch = self.processor, self.model, self.torch
+        # Settings use '' for automatic detection; the processor requires None.
+        language = sample.get("language", job.get("language")) or None
         inputs = processor.apply_transcription_request(
-            audio=sample["audio"], language=sample.get("language", job.get("language")),
+            audio=sample["audio"], language=language,
             prompt=job.get("context", ""),
         )
         inputs = inputs.to(model.device, model.dtype)

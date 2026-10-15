@@ -1,12 +1,16 @@
 import importlib.util
+from contextlib import nullcontext
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 import wave
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from lubo.asr_adapters import FireRedAsr2Adapter
+import numpy as np
+
+from lubo.asr_adapters import FireRedAsr2Adapter, Qwen3Adapter
 from lubo.asr_backend import model_identity
 from lubo.asr_profiles import get_asr_profile
 from lubo.quality_checkpoint import RecordingCheckpoint, recording_fingerprint, sha256_file
@@ -19,6 +23,52 @@ def make_wave(path: Path, seconds: int = 1) -> None:
         output.setsampwidth(2)
         output.setframerate(16000)
         output.writeframes(b"\0\0" * (16000 * seconds))
+
+
+class QwenLanguageTests(unittest.TestCase):
+    def test_auto_detection_reaches_processor_as_none_and_worker_completes(self):
+        # The installed processor accepts None for auto-detection and rejects ''.
+        class Inputs(dict):
+            def to(self, *_args):
+                return self
+
+        for job_language, sample_language, expected in [
+            ("", {}, None),
+            ("", {"language": ""}, None),
+            ("Chinese", {"language": ""}, None),
+            (None, {}, None),
+            ("Chinese", {}, "Chinese"),
+            ("Chinese", {"language": "English"}, "English"),
+        ]:
+            with self.subTest(job_language=job_language, sample=sample_language), TemporaryDirectory() as directory:
+                root = Path(directory)
+                audio = root / "sample.wav"
+                make_wave(audio)
+                processor = Mock()
+
+                def prepare(**kwargs):
+                    if kwargs["language"] == "":
+                        raise ValueError("Unsupported language: ''")
+                    return Inputs(input_ids=np.array([[1, 2]]))
+
+                processor.apply_transcription_request.side_effect = prepare
+                processor.decode.return_value = [{"transcription": "你好", "language": "Chinese"}]
+                adapter = Qwen3Adapter()
+                adapter.processor = processor
+                adapter.model = SimpleNamespace(device="cpu", dtype="float32",
+                                                generate=lambda **_kwargs: np.array([[1, 2, 3]]))
+                adapter.torch = SimpleNamespace(__version__="stub", inference_mode=nullcontext)
+                adapter.transformers_version = "stub"
+                adapter.model_info = {"revision": "stub"}
+                job = {"engine": "qwen3", "language": job_language, "align": False,
+                       "samples": [{"id": "chunk-00000", "audio": str(audio), **sample_language}]}
+                adapter.job = job
+                with patch.object(adapter, "load"), patch.object(adapter, "close"), \
+                        patch("lubo.quality_worker.create_quality_asr_adapter", return_value=adapter):
+                    result = run_job(job, root / "result.json")
+                self.assertTrue(result["ok"], result["samples"])
+                self.assertEqual(result["samples"][0]["text"], "你好")
+                self.assertEqual(processor.apply_transcription_request.call_args.kwargs["language"], expected)
 
 
 class FireRedAdapterTests(unittest.TestCase):
