@@ -1,7 +1,4 @@
-"""现代化主窗口：录播分段管理、资源配对、高级参数配置、实时运行控制与日志。
-
-提供现代卡片式视觉风格、深浅主题切换、工作流步骤导航与全功能录播流水线控制。
-"""
+"""主窗口：分段列表、设置、运行控制与日志。"""
 from __future__ import annotations
 
 import os
@@ -16,7 +13,7 @@ from PySide6.QtCore import QByteArray, QObject, QRunnable, QThreadPool, QTimer, 
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox,
-    QFileDialog, QFontComboBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
+    QFileDialog, QFontComboBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QSpinBox, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
@@ -28,11 +25,9 @@ from lubo.ffmpeg import FfmpegError, MediaInfo, find_tool, probe
 from lubo.segments import (
     VIDEO_SUFFIXES, Segment, default_output_base, is_source_video, make_segment, sort_segments,
 )
-from lubo.gui.theme import ThemeManager, fade_transition, icon_text
 from lubo.gui.job_controller import JobController
 
 APP_TITLE = "录播助手"
-APP_SUBTITLE = "LuboStudio · 录播分段拼接 · 弹幕烧录 · 自动字幕识别"
 SEGMENT_ROLE = Qt.ItemDataRole.UserRole
 TOKEN_ROLE = Qt.ItemDataRole.UserRole + 1
 LOG_MAX_LINES = 5000
@@ -150,7 +145,7 @@ class _ProbeTask(QRunnable):
             self._signals.probed.emit(self._token, None, str(exc) or type(exc).__name__)
 
 
-# ---------------------------------------------------------------- 现代控件
+# ---------------------------------------------------------------- 控件
 
 class SegmentTree(QTreeWidget):
     """录播分段列表树：支持内部平滑拖拽排序、系统文件拖入。"""
@@ -211,7 +206,7 @@ class ResourceTree(QTreeWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setColumnCount(3)
-        self.setHeaderLabels(["类型", "文件名", "关联视频状态"])
+        self.setHeaderLabels(["类型", "文件名", "关联视频"])
         self.setRootIsDecorated(False)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setAcceptDrops(True)
@@ -219,7 +214,7 @@ class ResourceTree(QTreeWidget):
         self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        self.header().resizeSection(2, 180)
+        self.header().resizeSection(2, 140)
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
@@ -243,7 +238,7 @@ class ResourceTree(QTreeWidget):
 
 
 class ColorButton(QPushButton):
-    """现代取色器按钮：带色块显示与十六进制颜色值。"""
+    """取色器按钮：带色块显示与十六进制颜色值。"""
 
     def __init__(self, color: str = "#FFFFFF", parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -267,12 +262,9 @@ class ColorButton(QPushButton):
             self._refresh()
 
     def _refresh(self) -> None:
-        text_color = "#000000" if self._color.lightness() > 140 else "#FFFFFF"
-        self.setText(f"  {self.color()}  ")
-        self.setStyleSheet(
-            f"background-color: {self.color()}; color: {text_color}; "
-            f"border: 1px solid #718096; border-radius: 6px; font-weight: bold; min-height: 22px;"
-        )
+        text_color = "#000000" if self._color.lightness() > 128 else "#FFFFFF"
+        self.setText(self.color())
+        self.setStyleSheet(f"background-color: {self.color()}; color: {text_color};")
 
 
 @dataclass
@@ -352,15 +344,10 @@ def _dspin(lo: float, hi: float, step: float, decimals: int, suffix: str = "") -
 def _form_page(rows: list[tuple[str, QWidget]]) -> QWidget:
     page = QWidget()
     form = QFormLayout(page)
-    form.setContentsMargins(12, 12, 12, 12)
-    form.setVerticalSpacing(10)
-    form.setHorizontalSpacing(16)
     form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
     for label, widget in rows:
         if label:
-            lbl = QLabel(label)
-            lbl.setStyleSheet("font-weight: 500;")
-            form.addRow(lbl, widget)
+            form.addRow(label, widget)
         else:
             form.addRow(widget)
     return page
@@ -388,17 +375,13 @@ class MainWindow(QMainWindow):
         self._last_srt_path: Path | None = None
         self._current_mode: str | None = None
         self._job_controller.log.connect(self.append_log)
-        self._job_controller.step.connect(lambda text: self.step_label.setText(f"⏳ {text}")
+        self._job_controller.step.connect(lambda text: self.step_label.setText(text)
                                           if hasattr(self, "step_label") else None)
         self._job_controller.progress.connect(self._on_progress)
         self._job_controller.finished.connect(self._on_finished)
         self._job_controller.failed.connect(self._on_failed)
         self._job_controller.cancelled.connect(self._on_cancelled)
         self._job_controller.runningChanged.connect(self._on_job_running_changed)
-
-        app = QApplication.instance()
-        self._theme_mgr = ThemeManager(app, initial_theme=getattr(self._settings, "theme", "dark"))
-        self._theme_mgr.themeChanged.connect(self._on_theme_changed)
 
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(4)
@@ -407,8 +390,7 @@ class MainWindow(QMainWindow):
         self._signals.probed.connect(self._on_probed)
 
         self.setWindowTitle(APP_TITLE)
-        self.resize(1380, 860)
-        self.setMinimumSize(1100, 700)
+        self.resize(1350, 820)
 
         self._build_ui()
         self._apply_settings()
@@ -419,7 +401,6 @@ class MainWindow(QMainWindow):
             self._prefix_user_edited = self._settings.prefix_user_edited
         self._restore_geometry()
         self._update_summary()
-        self._update_workflow_steps()
 
         restored = self._settings.last_resources or self._settings.last_segments
         if restored:
@@ -429,116 +410,29 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ 界面构建
 
     def _build_ui(self) -> None:
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self._build_workspace_box())
+        lower = QSplitter(Qt.Orientation.Horizontal)
+        lower.addWidget(self._build_settings_tabs())
+        lower.addWidget(self._build_log_box())
+        lower.setStretchFactor(0, 1)
+        lower.setStretchFactor(1, 1)
+        splitter.addWidget(lower)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
         central = QWidget()
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(12, 10, 12, 10)
-        main_layout.setSpacing(8)
-
-        # 1. 顶部 Header 与 流程导航
-        main_layout.addWidget(self._build_header())
-
-        # 2. 中部主体 Splitter
-        main_splitter = QSplitter(Qt.Orientation.Vertical)
-        main_splitter.addWidget(self._build_workspace_box())
-
-        lower_splitter = QSplitter(Qt.Orientation.Horizontal)
-        lower_splitter.addWidget(self._build_settings_tabs())
-        lower_splitter.addWidget(self._build_log_box())
-        lower_splitter.setStretchFactor(0, 5)
-        lower_splitter.setStretchFactor(1, 5)
-
-        main_splitter.addWidget(lower_splitter)
-        main_splitter.setStretchFactor(0, 5)
-        main_splitter.setStretchFactor(1, 4)
-        main_layout.addWidget(main_splitter, 1)
-
-        # 3. 底部执行控制面板
-        main_layout.addWidget(self._build_run_bar())
-
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(splitter, 1)
+        layout.addLayout(self._build_run_bar())
         self.setCentralWidget(central)
 
-    def _build_header(self) -> QWidget:
-        header = QFrame()
-        header.setObjectName("AppHeader")
-        layout = QHBoxLayout(header)
-        layout.setContentsMargins(12, 6, 12, 6)
-        layout.setSpacing(12)
-
-        # 品牌徽章与标题
-        brand_icon = QLabel("录")
-        brand_icon.setObjectName("HeaderLogo")
-        brand_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(brand_icon)
-
-        title_box = QVBoxLayout()
-        title_box.setSpacing(1)
-        self.app_title_lbl = QLabel(APP_TITLE)
-        self.app_title_lbl.setObjectName("HeaderTitle")
-        self.app_subtitle_lbl = QLabel(APP_SUBTITLE)
-        self.app_subtitle_lbl.setObjectName("HeaderSubtitle")
-        title_box.addWidget(self.app_title_lbl)
-        title_box.addWidget(self.app_subtitle_lbl)
-        layout.addLayout(title_box)
-
-        layout.addStretch(1)
-
-        # 4步工作流向导
-        self.step_bar = QFrame()
-        self.step_bar.setObjectName("StepBar")
-        step_layout = QHBoxLayout(self.step_bar)
-        step_layout.setContentsMargins(4, 2, 4, 2)
-        step_layout.setSpacing(4)
-
-        self.step_pills = [
-            QLabel("① 导入分段"),
-            QLabel("② 生成字幕"),
-            QLabel("③ 校对字幕"),
-            QLabel("④ 烤入成片"),
-        ]
-        for i, pill in enumerate(self.step_pills):
-            pill.setProperty("class", "step-pill")
-            pill.setObjectName(f"StepPill_{i}")
-            step_layout.addWidget(pill)
-            if i < len(self.step_pills) - 1:
-                arrow = QLabel("→")
-                arrow.setStyleSheet("color: #64748b; font-size: 11px;")
-                step_layout.addWidget(arrow)
-
-        layout.addWidget(self.step_bar)
-        layout.addStretch(1)
-
-        # 主题切换按钮
-        self.btn_theme = QPushButton()
-        self.btn_theme.setObjectName("ThemeToggleBtn")
-        self._update_theme_btn_text()
-        self.btn_theme.clicked.connect(self._toggle_theme)
-        layout.addWidget(self.btn_theme)
-
-        return header
-
-    def _update_theme_btn_text(self) -> None:
-        is_dark = self._theme_mgr.current_theme() == "dark"
-        self.btn_theme.setText("浅色模式" if is_dark else "深色模式")
-
-    def _toggle_theme(self) -> None:
-        self._theme_mgr.toggle_theme()
-        self._settings.theme = self._theme_mgr.current_theme()
-        fade_transition(self, duration=220)
-        self._update_theme_btn_text()
-
-    def _on_theme_changed(self, theme_name: str) -> None:
-        self._update_theme_btn_text()
 
     def _build_workspace_box(self) -> QGroupBox:
-        box = QGroupBox("工作区 · 录播分段与资源管理")
+        box = QGroupBox("分段（可拖动排序，可从资源管理器拖入视频、XML、图片或文件夹）")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(10, 14, 10, 8)
-        layout.setSpacing(8)
-
-        # 工具栏
         toolbar = QHBoxLayout()
-        toolbar.setSpacing(6)
-
         self.btn_add_folder = QPushButton("添加文件夹")
         self.btn_add_files = QPushButton("添加视频/XML/图片")
         self.btn_up = QPushButton("上移")
@@ -546,26 +440,18 @@ class MainWindow(QMainWindow):
         self.btn_remove = QPushButton("移除")
         self.btn_clear = QPushButton("清空")
         self.btn_sort = QPushButton("按时间排序")
-
         for button in (self.btn_add_folder, self.btn_add_files, self.btn_up,
                        self.btn_down, self.btn_remove, self.btn_clear, self.btn_sort):
             toolbar.addWidget(button)
-
         toolbar.addStretch(1)
-
-        # 统计 Badge
         self.summary_label = QLabel()
-        self.summary_label.setObjectName("SummaryBadge")
         toolbar.addWidget(self.summary_label)
-
         layout.addLayout(toolbar)
 
-        # 分段与资源选项卡
         self.workspace_tabs = QTabWidget()
         self.workspace_tabs.addTab(self._build_order_pane(), "视频分段")
         self.workspace_tabs.addTab(self._build_resource_pane(), "导入的资源（XML / 图片）")
         layout.addWidget(self.workspace_tabs, 1)
-
         self._segment_buttons = [
             self.btn_add_folder, self.btn_add_files, self.btn_up, self.btn_down,
             self.btn_remove, self.btn_clear, self.btn_sort, self.btn_add_to_order,
@@ -583,19 +469,16 @@ class MainWindow(QMainWindow):
         self.btn_remove.clicked.connect(self.remove_selected)
         self.btn_clear.clicked.connect(self.clear_segments)
         self.btn_sort.clicked.connect(self.sort_by_time)
-
         return box
 
     def _build_order_pane(self) -> QWidget:
         pane = QWidget()
         layout = QVBoxLayout(pane)
-        layout.setContentsMargins(4, 6, 4, 4)
         self.tree = SegmentTree()
         layout.addWidget(self.tree)
         self.tree.filesDropped.connect(self.add_paths)
         self.tree.orderChanged.connect(self._on_segments_changed)
         self.tree.itemSelectionChanged.connect(self._sync_target_to_selection)
-
         remove_action = QAction(self.tree)
         remove_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Delete))
         remove_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
@@ -606,36 +489,26 @@ class MainWindow(QMainWindow):
     def _build_resource_pane(self) -> QWidget:
         pane = QWidget()
         layout = QVBoxLayout(pane)
-        layout.setContentsMargins(4, 6, 4, 4)
-        layout.setSpacing(6)
-
         actions = QHBoxLayout()
-        actions.setSpacing(8)
-
-        self.btn_add_to_order = QPushButton("选中视频加入排序")
+        self.btn_add_to_order = QPushButton("视频加入排序")
         self.resource_target = QComboBox()
-        self.resource_target.setMinimumWidth(260)
+        self.resource_target.setMinimumWidth(220)
         self.btn_link_resource = QPushButton("关联到目标视频")
         self.btn_unlink_resource = QPushButton("取消关联")
         self.btn_remove_resource = QPushButton("移除资源")
-
         actions.addWidget(self.btn_add_to_order)
-        actions.addSpacing(8)
-        actions.addWidget(QLabel("目标视频:"))
+        actions.addSpacing(12)
+        actions.addWidget(QLabel("目标视频"))
         actions.addWidget(self.resource_target, 1)
         actions.addWidget(self.btn_link_resource)
         actions.addWidget(self.btn_unlink_resource)
         actions.addWidget(self.btn_remove_resource)
         layout.addLayout(actions)
-
         self.resource_tree = ResourceTree()
         layout.addWidget(self.resource_tree)
-
-        hint = QLabel("💡 提示：同名 XML 弹幕及封面图片会自动配对；若名称不同，可在此选中资源并在上方选择目标视频后点击“关联到目标视频”。")
-        hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        hint = QLabel("同名 XML/封面会自动配对；名称不同可选中资源、选择目标视频后点击“关联到目标视频”。")
         hint.setWordWrap(True)
         layout.addWidget(hint)
-
         self.resource_tree.filesDropped.connect(self.add_paths)
         return pane
 
@@ -648,84 +521,79 @@ class MainWindow(QMainWindow):
         self.tabs = tabs
         b = self._bind
 
-        # 1. 输出设置
+        # 输出
         self.output_dir_edit = QLineEdit()
         self.output_dir_edit.setPlaceholderText("留空 = 第一个分段所在文件夹")
         self.output_dir_edit.textChanged.connect(self._update_output_hint)
         browse = QPushButton("浏览…")
         browse.clicked.connect(self._choose_output_dir)
-
         dir_row = QWidget()
         dir_layout = QHBoxLayout(dir_row)
         dir_layout.setContentsMargins(0, 0, 0, 0)
-        dir_layout.setSpacing(6)
         dir_layout.addWidget(self.output_dir_edit, 1)
         dir_layout.addWidget(browse)
-
         self.prefix_edit = QLineEdit()
         self.prefix_edit.setPlaceholderText("默认 = 第一个分段的文件名")
         self.prefix_edit.textEdited.connect(self._on_prefix_edited)
         self.prefix_edit.textChanged.connect(self._update_output_hint)
-
         self.output_hint = QLabel()
         self.output_hint.setWordWrap(True)
-        self.output_hint.setStyleSheet("color: #38bdf8; font-size: 11px;")
-
+        self.output_hint.setStyleSheet("color: gray;")
         b("", "output_dir", self.output_dir_edit)
         tabs.addTab(_form_page([
-            ("输出目标文件夹", dir_row),
-            ("产物文件名前缀", self.prefix_edit),
+            ("输出文件夹", dir_row),
+            ("文件名前缀", self.prefix_edit),
             ("", self.output_hint),
-            ("", b("", "keep_intermediate", QCheckBox("保留中间文件（烧录分段、合并临时视频、识别 wav 等）"))),
-            ("", b("", "overwrite", QCheckBox("覆盖已有文件（不勾选则智能复用已存在的产物，便于断点续跑）"))),
+            ("", b("", "keep_intermediate", QCheckBox("保留中间文件（烧录分段、合并视频、wav 等）"))),
+            ("", b("", "overwrite", QCheckBox("覆盖已有文件（不勾选则复用已存在的产物，便于中断后续跑）"))),
         ]), "输出")
 
-        # 2. 步骤设置
-        self.btn_custom = QPushButton("按勾选步骤自定义运行（高级重跑模式）")
+        # 步骤
+        self.btn_custom = QPushButton("按勾选步骤运行（高级）")
         self.btn_custom.clicked.connect(self.start)
         tabs.addTab(_form_page([
-            ("", b("steps", "burn_danmaku", QCheckBox("1. 每段烧录弹幕 (XML → NVENC/x264)"))),
-            ("", b("steps", "concat", QCheckBox("2. 顺序拼接所有分段 (无损 concat)"))),
-            ("", b("steps", "asr", QCheckBox("3. 语音识别自动生成字幕 (.srt)"))),
-            ("", b("steps", "burn_subtitles", QCheckBox("4. 烧录字幕并附加封面图片 (.完整版.mp4)"))),
+            ("", b("steps", "burn_danmaku", QCheckBox("1. 每段烧录弹幕"))),
+            ("", b("steps", "concat", QCheckBox("2. 拼接所有分段"))),
+            ("", b("steps", "asr", QCheckBox("3. 语音识别生成字幕"))),
+            ("", b("steps", "burn_subtitles", QCheckBox("4. 烧录字幕并附加封面"))),
             ("", self.btn_custom),
         ]), "步骤")
 
-        # 3. 编码设置
+        # 编码
         self.encoder_combo = _combo(ENCODERS)
         self.preset_combo = QComboBox()
         self.encoder_combo.currentIndexChanged.connect(self._on_encoder_changed)
         tabs.addTab(_form_page([
-            ("视频编码器", b("encode", "encoder", self.encoder_combo)),
-            ("编码预设", b("encode", "preset", self.preset_combo)),
-            ("弹幕烧录画质 (CQ)", b("encode", "danmaku_cq", _spin(0, 51))),
-            ("成片画质 (CQ)", b("encode", "final_cq", _spin(0, 51))),
+            ("编码器", b("encode", "encoder", self.encoder_combo)),
+            ("预设", b("encode", "preset", self.preset_combo)),
+            ("弹幕烧录质量 (CQ)", b("encode", "danmaku_cq", _spin(0, 51))),
+            ("成品质量 (CQ)", b("encode", "final_cq", _spin(0, 51))),
             ("音频码率", b("encode", "audio_bitrate", _combo(AUDIO_BITRATES))),
-            ("", QLabel("💡 提示：CQ 数值越小画质越高、体积越大。弹幕烧录为中间过渡阶段，建议比成片画质更高（CQ 更小）。")),
+            ("", QLabel("CQ 越小画质越高、文件越大；弹幕烧录是中间文件，建议比成品略小。")),
         ]), "编码")
 
-        # 4. 弹幕样式
+        # 弹幕
         tabs.addTab(_form_page([
-            ("弹幕字体", b("danmaku", "font", QFontComboBox())),
+            ("字体", b("danmaku", "font", QFontComboBox())),
             ("字号倍率", b("danmaku", "font_scale", _dspin(0.5, 4.0, 0.1, 2))),
             ("可见度", b("danmaku", "opacity", _spin(0, 100, " %"))),
             ("滚动弹幕时长", b("danmaku", "scroll_duration", _dspin(1, 30, 0.5, 1, " 秒"))),
-            ("静止弹幕时长", b("danmaku", "static_duration", _dspin(1, 30, 0.5, 1, " 秒"))),
-            ("显示区域上限", b("danmaku", "area_ratio", _dspin(0.05, 1.0, 0.05, 2, " 高度"))),
+            ("顶部/底部弹幕时长", b("danmaku", "static_duration", _dspin(1, 30, 0.5, 1, " 秒"))),
+            ("显示区域（占画面高度）", b("danmaku", "area_ratio", _dspin(0.05, 1.0, 0.05, 2))),
         ]), "弹幕")
 
-        # 5. 字幕样式
+        # 字幕
         tabs.addTab(_form_page([
-            ("字幕字体", b("subtitle", "font", QFontComboBox())),
-            ("字号比例", b("subtitle", "size_ratio", _dspin(0.01, 0.2, 0.005, 3, " 高度"))),
-            ("描边宽度", b("subtitle", "outline", _dspin(0, 10, 0.5, 1, " 像素"))),
-            ("底边间距", b("subtitle", "margin_ratio", _dspin(0, 0.3, 0.01, 3, " 高度"))),
-            ("文字主色", b("subtitle", "primary_color", ColorButton())),
+            ("字体", b("subtitle", "font", QFontComboBox())),
+            ("字号（占画面高度）", b("subtitle", "size_ratio", _dspin(0.01, 0.2, 0.005, 3))),
+            ("描边（1080p 基准）", b("subtitle", "outline", _dspin(0, 10, 0.5, 1))),
+            ("底边距（占画面高度）", b("subtitle", "margin_ratio", _dspin(0, 0.3, 0.01, 3))),
+            ("文字颜色", b("subtitle", "primary_color", ColorButton())),
             ("描边颜色", b("subtitle", "outline_color", ColorButton())),
-            ("每行最大字数", b("subtitle", "max_chars", _spin(6, 80))),
+            ("每条最多字数", b("subtitle", "max_chars", _spin(6, 80))),
         ]), "字幕")
 
-        # 6. 语音识别
+        # 识别
         self.asr_engine_combo = _combo(ASR_ENGINES)
         self.quality_model_combo = _combo(QUALITY_MODELS)
         self.asr_language_combo = _combo(ASR_LANGUAGES)
@@ -733,6 +601,11 @@ class MainWindow(QMainWindow):
         self.asr_context_edit.setPlaceholderText("可填主播名、角色名、热词专业词或录播主题")
         self.asr_device_combo = _combo(ASR_DEVICES)
         self.asr_chunk_seconds = _dspin(30, 120, 30, 0, " 秒")
+        asr_hint = QLabel(
+            "高精度模式在本地 CPU 上运行，首次使用需下载模型。"
+            "Qwen3 支持语言与词汇提示；FireRed 不支持这些选项。"
+            "重新识别已有字幕时，请取消“跳过识别”。")
+        asr_hint.setWordWrap(True)
         tabs.addTab(_form_page([
             ("识别方案", b("asr", "engine", self.asr_engine_combo)),
             ("高精度模型", b("asr", "quality_model", self.quality_model_combo)),
@@ -741,7 +614,7 @@ class MainWindow(QMainWindow):
             ("快捷设备（仅 Paraformer）", b("asr", "device", self.asr_device_combo)),
             ("分块时长（仅 Paraformer）", b("asr", "chunk_seconds", self.asr_chunk_seconds)),
             ("", b("asr", "reuse_existing_srt", QCheckBox("已有同名 .srt 时跳过识别（方便手动改字幕后直接重烤）"))),
-            ("", QLabel("💡 高精度模式采用 CPU 完整精度并全程本地运行。Qwen3 支持语言与词汇提示；FireRedASR2-AED 不支持时会禁用对应项。\n首次运行会自动下载所选模型。若已有旧字幕，取消“跳过识别”可重新生成。")),
+            ("", asr_hint),
         ]), "识别")
         self.asr_engine_combo.currentIndexChanged.connect(self._on_asr_controls_changed)
         self.quality_model_combo.currentIndexChanged.connect(self._on_asr_controls_changed)
@@ -750,70 +623,36 @@ class MainWindow(QMainWindow):
         return tabs
 
     def _build_log_box(self) -> QGroupBox:
-        box = QGroupBox("运行日志")
+        box = QGroupBox("日志")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(10, 14, 10, 8)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(LOG_MAX_LINES)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        font = QFont("Consolas", 9)
+        font = QFont("Consolas")
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.log_view.setFont(font)
         layout.addWidget(self.log_view)
         return box
 
-    def _build_run_bar(self) -> QWidget:
-        container = QFrame()
-        container.setObjectName("BottomBar")
-        bar = QHBoxLayout(container)
-        bar.setContentsMargins(12, 8, 12, 8)
-        bar.setSpacing(10)
-
-        # 核心步骤按钮 1
+    def _build_run_bar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
         self.btn_start = QPushButton("① 生成字幕")
-        self.btn_start.setProperty("variant", "primary")
-        self.btn_start.setMinimumWidth(130)
-        self.btn_start.setMinimumHeight(38)
-        self.btn_start.setToolTip("执行烧录弹幕、拼接视频及语音识别，导出 .srt 字幕供校对修改")
-
-        # 核心步骤按钮 2
+        self.btn_start.setMinimumWidth(110)
         self.btn_burn_subtitles = QPushButton("② 烤入成片")
-        self.btn_burn_subtitles.setProperty("variant", "secondary")
-        self.btn_burn_subtitles.setMinimumWidth(130)
-        self.btn_burn_subtitles.setMinimumHeight(38)
-        self.btn_burn_subtitles.setToolTip("读取用户校对后的 .srt 字幕，合成附带封面的完整版视频")
-
-        # 取消按钮
+        self.btn_burn_subtitles.setMinimumWidth(110)
         self.btn_cancel = QPushButton("取消")
-        self.btn_cancel.setProperty("variant", "danger")
         self.btn_cancel.setEnabled(False)
-        self.btn_cancel.setMinimumHeight(38)
-
-        # 进度条
+        self.btn_open = QPushButton("打开输出文件夹")
+        self.btn_open.setEnabled(False)
+        self.btn_edit_srt = QPushButton("用记事本改字幕")
+        self.btn_edit_srt.setEnabled(False)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%")
-        self.progress_bar.setMinimumHeight(24)
-
-        # 状态 Chip
         self.step_label = QLabel("就绪")
-        self.step_label.setObjectName("StatusChip")
-        self.step_label.setMinimumWidth(180)
-        self.step_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        # 辅助功能按钮
-        self.btn_edit_srt = QPushButton("修改字幕 (记事本)")
-        self.btn_edit_srt.setEnabled(False)
-        self.btn_edit_srt.setMinimumHeight(34)
-        self.btn_edit_srt.setToolTip("用记事本打开生成的 SRT 字幕文件")
-
-        self.btn_open = QPushButton("打开输出目录")
-        self.btn_open.setEnabled(False)
-        self.btn_open.setMinimumHeight(34)
-        self.btn_open.setToolTip("在文件管理器中打开输出目录")
-
+        self.step_label.setMinimumWidth(220)
         bar.addWidget(self.btn_start)
         bar.addWidget(self.btn_burn_subtitles)
         bar.addWidget(self.btn_cancel)
@@ -821,42 +660,13 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.step_label)
         bar.addWidget(self.btn_edit_srt)
         bar.addWidget(self.btn_open)
-
         self.btn_start.clicked.connect(self.generate_subtitles)
         self.btn_burn_subtitles.clicked.connect(self.burn_subtitles)
         self.btn_cancel.clicked.connect(self.cancel)
         self.btn_edit_srt.clicked.connect(self._edit_srt)
         self.btn_open.clicked.connect(self._open_output_dir)
+        return bar
 
-        return container
-
-    # ------------------------------------------------------------ 流程状态更新
-
-    def _update_workflow_steps(self) -> None:
-        """更新顶部流程导航高亮。"""
-        segs = self.segments()
-        has_segs = len(segs) > 0
-        has_srt = self._last_srt_path is not None and self._last_srt_path.is_file()
-
-        # Step 0: 导入分段
-        self.step_pills[0].setProperty("active", "false" if has_segs else "true")
-        self.step_pills[0].setProperty("completed", "true" if has_segs else "false")
-
-        # Step 1: 生成字幕
-        self.step_pills[1].setProperty("active", "true" if has_segs and not has_srt else "false")
-        self.step_pills[1].setProperty("completed", "true" if has_srt else "false")
-
-        # Step 2: 校对字幕
-        self.step_pills[2].setProperty("active", "true" if has_srt else "false")
-        self.step_pills[2].setProperty("completed", "false")
-
-        # Step 3: 烤入成片
-        self.step_pills[3].setProperty("active", "false")
-        self.step_pills[3].setProperty("completed", "false")
-
-        for pill in self.step_pills:
-            pill.style().unpolish(pill)
-            pill.style().polish(pill)
 
     # ------------------------------------------------------------ 设置管理
 
@@ -923,7 +733,6 @@ class MainWindow(QMainWindow):
         s.last_output_base = self.prefix_edit.text().strip()
         s.prefix_user_edited = self._prefix_user_edited
         s.window_geometry = bytes(self.saveGeometry().toBase64().data()).decode("ascii")
-        s.theme = self._theme_mgr.current_theme()
 
     def _save_settings(self) -> None:
         self._store_settings()
@@ -1163,7 +972,6 @@ class MainWindow(QMainWindow):
             self.prefix_edit.setText(default_output_base(segs) if segs else "")
         self._update_summary()
         self._refresh_resource_links()
-        self._update_workflow_steps()
 
     def _update_summary(self) -> None:
         segs = self.segments()
@@ -1179,7 +987,7 @@ class MainWindow(QMainWindow):
             return
         base = self.prefix_edit.text().strip()
         self.output_hint.setText(
-            f"💡 流程：先生成 {base}.srt，校对修改后再烤入 {base}.完整版.mp4。"
+            f"流程：先生成 {base}.srt，校对修改后再烤入 {base}.完整版.mp4。"
             if base else "")
         segments = self.segments() if hasattr(self, "tree") else []
         out_text = self.output_dir_edit.text().strip()
@@ -1194,7 +1002,6 @@ class MainWindow(QMainWindow):
                 self._last_srt_path is not None and self._last_srt_path.is_file())
         if hasattr(self, "btn_open") and not self.is_running():
             self.btn_open.setEnabled(output_dir is not None and output_dir.is_dir())
-        self._update_workflow_steps()
 
     def _on_prefix_edited(self, text: str) -> None:
         self._prefix_user_edited = bool(text.strip())
@@ -1463,7 +1270,7 @@ class MainWindow(QMainWindow):
         self.btn_open.setEnabled(False)
         self.btn_edit_srt.setEnabled(False)
         self.progress_bar.setValue(0)
-        self.step_label.setText("▶ 准备中…")
+        self.step_label.setText("准备中…")
         self.append_log(f"开始处理 {len(segs)} 个分段 → {job.output_dir}（前缀：{job.output_base}）")
 
         if not self._job_controller.start(job, mode):
@@ -1472,7 +1279,7 @@ class MainWindow(QMainWindow):
     def cancel(self) -> None:
         if self._job_controller.cancel():
             self.btn_cancel.setEnabled(False)
-            self.step_label.setText("■ 正在终止…")
+            self.step_label.setText("正在终止…")
             self.append_log("收到取消指令，正在等待当前任务平稳退出…")
 
     def _set_running(self, running: bool) -> None:
@@ -1489,31 +1296,29 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, outputs: list) -> None:
         self.progress_bar.setValue(1000)
-        self.step_label.setText("✓ 处理完成")
+        self.step_label.setText("处理完成")
         self.append_log("全部任务顺利完成！产物列表：")
         for path in outputs:
             self.append_log(f"  · {path}")
         if self._current_mode == "generate":
-            self.append_log("💡 提示：可以在输出目录校对修改 SRT 字幕，完成后点击“② 烤入成片”。")
+            self.append_log("提示：可以在输出目录校对修改 SRT 字幕，完成后点击“② 烤入成片”。")
         self.btn_open.setEnabled(self._last_output_dir is not None)
-        self._update_workflow_steps()
         QApplication.alert(self)
 
     def _on_failed(self, message: str) -> None:
-        self.step_label.setText("✕ 处理失败")
+        self.step_label.setText("处理失败")
         self.append_log(f"处理发生错误：{message}")
         if not self._close_pending:
             self._message(QMessageBox.Icon.Critical, "处理失败", message[-2000:])
 
     def _on_cancelled(self) -> None:
-        self.step_label.setText("■ 已取消")
+        self.step_label.setText("已取消")
         self.append_log("任务已取消。")
 
     def _on_job_running_changed(self, running: bool) -> None:
         self._set_running(running)
         if running:
             return
-        self._update_workflow_steps()
         if self._close_pending:
             QTimer.singleShot(0, self.close)
 
