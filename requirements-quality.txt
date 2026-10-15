@@ -1,0 +1,6 @@
+# Install alongside the project's base requirements for source-based evaluation.
+# The supplied native worker reuses the existing bundled Torch/Transformers.
+transformers==5.17.0
+accelerate==1.15.0
+psutil==7.0.0
+jieba==0.42.1

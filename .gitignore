@@ -1,9 +1,10 @@
 .venv/
+quality_models/
+quality_support/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .tmp/
-tests/
 build/
 dist/
 docs/*预览.png

@@ -144,9 +144,14 @@ finally {
 $exe = Join-Path $outputDir '录播助手.exe'
 foreach ($required in @($exe, (Join-Path $outputDir 'bin\ffmpeg.exe'),
         (Join-Path $outputDir 'bin\ffprobe.exe'),
-        (Join-Path $outputDir 'licenses\ffmpeg\LICENSE'))) {
+        (Join-Path $outputDir 'licenses\ffmpeg\LICENSE'),
+        (Join-Path $outputDir 'quality_support\firered_worker.py'),
+        (Join-Path $outputDir 'quality_support\firered_runtime.py'))) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "打包产物缺少文件：$required"
     }
 }
+& $python (Join-Path $projectRoot 'scripts\verify_refactor_release.py') `
+    --app-dir $outputDir --exe $exe --source-root $projectRoot --smoke-worker-entry
+if ($LASTEXITCODE -ne 0) { throw '发行目录验证失败。' }
 Write-Host "打包完成：$exe"

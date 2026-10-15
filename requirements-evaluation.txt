@@ -1,0 +1,4 @@
+# Pure subtitle regressions and independently referenced quality scoring.
+numpy==2.2.6
+rapidfuzz==3.14.3
+jieba==0.42.1

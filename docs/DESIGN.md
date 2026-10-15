@@ -214,6 +214,7 @@ class Transcriber:
 - 长音频（数小时）处理：用标准库 `wave` 按最长 120 秒的窗口读取 16 kHz/16 位/单声道 WAV，逐窗做 FSMN-VAD，避免把整场音频加载进内存；再按静音边界把音频切成
   ≤ `chunk_seconds` 的块；对每块调用 ASR+标点（带 `sentence_timestamp=True`），把时间偏移回全局时间；
   每块完成后回调进度并检查 cancel（抛 `lubo.ffmpeg.Cancelled`）。
+  该路径作为快捷模式保留。默认高精度模式由 `lubo/asr_backend.py` 创建独立进程，使用带上下文的有界分块、Qwen3-ASR 与独立强制对齐；完整精度 CPU 运行、恢复重试和最终时间轴拼接分别在 `quality_worker.py` / `quality_recording.py` 中处理。
 - 句子超过 `max_chars` 时，利用字级时间戳拆分成多条 Cue；去掉句尾的逗号句号等标点；过滤空文本。
 - cuda 不可用时自动退回 cpu 并记录日志。
 
@@ -254,7 +255,7 @@ class Pipeline:
 - 第 1 步：某段没有 xml 时，照常编码（不加弹幕滤镜），保证所有分段编码参数一致，拼接不出错。
 - 第 1 步输出不附加封面（避免 concat 出问题）；只映射 `0:v:0` 和 `0:a:0?`。
 - 第 2 步：只有 1 个分段时跳过拼接，直接用该分段产物。concat 列表文件写到工作目录，用 `file 'path'` 格式，路径中的 `'` 转义为 `'\''`，加 `-safe 0`；`-map 0:v:0 -map 0:a? -c copy -movflags +faststart`。
-- 第 3 步：`ffmpeg -i merged -vn -ac 1 -ar 16000 -c:a pcm_s16le {base}.wav`；识别完成后调用 `Transcriber.close()`。
+- 第 3 步：`ffmpeg -i merged -map 0:a:0 -vn -ac 1 -ar 16000 -af aresample=async=1000:first_pts=0 -c:a pcm_s16le {base}.wav`；缓存记录包含抽取版本与源文件状态，旧 WAV 会重新生成；识别完成后关闭对应的识别后端。
 - 第 4 步：`[0:v]ass=subs.ass[v]`；封面取第一个带封面的分段，作为 `attached_pic`（`-c:v:1 mjpeg -disposition:v:1 attached_pic`）；`-c:a copy`；`-movflags +faststart`。
 - 编码参数：nvenc → `-c:v X -preset P -rc vbr -cq N -b:v 0 -pix_fmt yuv420p`；libx264 → `-c:v libx264 -preset P -crf N -pix_fmt yuv420p`。
   若选的是 nvenc 但 `has_encoder` 为 False，退回 libx264（preset 映射为 medium）并记录日志。

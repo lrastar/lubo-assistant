@@ -43,13 +43,31 @@ hiddenimports = collect_submodules("funasr")
 hiddenimports += collect_submodules("modelscope.hub")
 hiddenimports += collect_submodules("modelscope_hub")
 hiddenimports += ["torchaudio", "soundfile"]
+# Qwen3-ASR and its forced aligner are loaded by the isolated quality worker;
+# keep their Transformers modules in the archive even though the main GUI does
+# not import them until a worker starts. Jieba is optional at runtime, but its
+# bundled dictionary makes Chinese subtitle splitting available offline.
+hiddenimports += collect_submodules("transformers.models.qwen3_asr")
+hiddenimports += collect_submodules("jieba")
+datas += collect_data_files("jieba", excludes=["**/__pycache__/**"])
+# FireRed runs in its own Python environment. These two support scripts are
+# launched as files from quality_support and must not be folded into the GUI
+# process or its Qwen dependency set.
+for worker_script in ("firered_worker.py", "firered_runtime.py"):
+    source = root / "scripts" / worker_script
+    if not source.is_file():
+        raise RuntimeError(f"缺少 FireRed 运行脚本：{source}")
+    datas.append((str(source), "quality_support"))
 # FunASR 的注册装饰器会 inspect.getsourcelines(模型类)；冻结包仅有
 # PYZ 字节码时显式导入模型会失败，因此需要把其 .py 源码也放在包内。
 datas += collect_data_files("funasr", include_py_files=True, excludes=["**/__pycache__/**"])
 datas += collect_data_files("modelscope")
 datas += collect_data_files("modelscope_hub")
 
-for distribution in ("funasr", "modelscope", "modelscope-hub", "torch", "torchaudio", "huggingface-hub"):
+for distribution in (
+    "funasr", "modelscope", "modelscope-hub", "torch", "torchaudio",
+    "huggingface-hub", "transformers", "accelerate", "jieba",
+):
     try:
         datas += copy_metadata(distribution)
     except Exception:

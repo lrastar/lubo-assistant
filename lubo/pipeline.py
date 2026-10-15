@@ -1,19 +1,19 @@
 """录播处理流水线：烧弹幕、拼接、识别语音、烧字幕。"""
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import tempfile
 import threading
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
-from lubo.asr import Transcriber
-from lubo.config import Settings, settings_path
+from lubo.asr_backend import create_transcriber
+from lubo.artifact_store import (
+    ArtifactStore, media_valid, part_path, read_json, wav_valid, write_json_atomic,
+)
+from lubo.config import Settings
 from lubo.danmaku import xml_to_ass
 from lubo.ffmpeg import Cancelled, FfmpegError, MediaInfo, has_encoder, probe, run_ffmpeg
 from lubo.segments import Segment
@@ -27,6 +27,7 @@ class Job:
     output_dir: Path
     output_base: str
     strict_srt_source: bool = False
+    warnings: list[str] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -36,174 +37,31 @@ class PipelineCallbacks:
     progress: Callable[[float], None]
 
 
-def _part_path(path: Path) -> Path:
-    return path.with_name(f"{path.stem}.part{path.suffix}")
-
-
-def _media_valid(path: Path) -> bool:
-    try:
-        return path.is_file() and path.stat().st_size > 0 and probe(path).duration > 0
-    except (OSError, FfmpegError, ValueError):
-        return False
-
-
-def _wav_valid(path: Path) -> bool:
-    import wave
-
-    try:
-        with wave.open(str(path), "rb") as wav:
-            return (wav.getnframes() > 0 and wav.getnchannels() == 1
-                    and wav.getframerate() == 16000 and wav.getsampwidth() == 2)
-    except (OSError, EOFError, wave.Error):
-        return False
-
-
 def _concat_quote(path: Path) -> str:
     # ffconcat 使用单引号引路径；其中的单引号须先退出引用再转义。
     return str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
 
 
-def _work_directory(job: Job) -> Path:
-    root = os.environ.get("LUBO_WORK_DIR")
-    if root:
-        base = Path(root)
-    else:
-        local = os.environ.get("LOCALAPPDATA")
-        base = (Path(local) if local else Path.home() / "AppData" / "Local") / "LuboStudio" / "work"
-    identity = json.dumps({
-        "segments": [str(Path(segment.video).resolve()) for segment in job.segments],
-        "output_dir": str(Path(job.output_dir).resolve()),
-        "output_base": job.output_base,
-        "burn_danmaku": job.settings.steps.burn_danmaku,
-        "danmaku": asdict(job.settings.danmaku),
-        "intermediate_encode": {
-            "encoder": job.settings.encode.encoder,
-            "preset": job.settings.encode.preset,
-            "quality": job.settings.encode.danmaku_cq,
-            "audio_bitrate": job.settings.encode.audio_bitrate,
-        },
-    }, ensure_ascii=False, sort_keys=True)
-    return base / hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
-
-
-def _file_stamp(path: Path | None) -> dict[str, object] | None:
-    if path is None:
-        return None
-    path = Path(path).resolve()
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return {"path": str(path), "missing": True}
-    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _read_json(path: Path) -> dict | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".lubo_", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as output:
-            json.dump(data, output, ensure_ascii=False, sort_keys=True)
-        os.replace(tmp, path)
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-
-
 class Pipeline:
-    def __init__(self, job: Job, callbacks: PipelineCallbacks):
+    def __init__(self, job: Job, callbacks: PipelineCallbacks, *,
+                 work_root: Path | None = None, state_root: Path | None = None,
+                 artifact_store: ArtifactStore | None = None):
         self.job = job
         self.callbacks = callbacks
         self.cancel = threading.Event()
-        self.work_dir = _work_directory(job)
+        self.artifacts = artifact_store or ArtifactStore(
+            job, work_root=work_root, state_root=state_root)
+        self.work_dir = self.artifacts.work_dir
         self._scratch = Path()
         self._encoder = ""
         self._preset = ""
         self._done_weight = 0.0
         self._total_weight = 1.0
         self._intermediates: set[Path] = set()
-        self._source_snapshot: list[dict[str, object]] = []
-
-    @staticmethod
-    def _record_name(kind: str, path: Path) -> str:
-        canonical = os.path.normcase(str(path.resolve()))
-        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        return f"{kind}-{digest}.json"
-
-    def _job_record_path(self, kind: str, path: Path) -> Path:
-        return settings_path().parent / "jobs" / self._record_name(kind, path)
 
     def _work_record_path(self, kind: str, path: Path) -> Path:
-        return self.work_dir / self._record_name(kind, path)
-
-    def _snapshot_sources(self) -> list[dict[str, object]]:
-        return [{"video": _file_stamp(segment.video), "xml": _file_stamp(segment.xml)}
-                for segment in self.job.segments]
-
-    def _assert_sources_unchanged(self) -> None:
-        if self._snapshot_sources() != self._source_snapshot:
-            raise RuntimeError("处理期间原始视频或弹幕 XML 发生变化，请等待录播结束后重新生成字幕")
-
-    def _srt_record(self, path: Path) -> dict:
-        return {"version": 1, "srt": str(path.resolve()),
-                "segments": self._source_snapshot}
-
-    def _srt_record_state(self, path: Path) -> str:
-        expected = self._srt_record(path)
-        global_path = self._job_record_path("srt", path)
-        work_path = self._work_record_path("srt", path)
-        # 全局记录是权威来源；旧工作目录可能包含同名字幕的过期资料。
-        record_path = global_path if global_path.exists() else work_path
-        if not record_path.exists():
-            return "missing"
-        return "match" if _read_json(record_path) == expected else "mismatch"
-
-    def _save_srt_record(self, path: Path) -> None:
-        record = self._srt_record(path)
-        _write_json(self._work_record_path("srt", path), record)
-        _write_json(self._job_record_path("srt", path), record)
-
-    def _render_record(self, target: Path, srt: Path, cover: Path | None) -> dict:
-        encode = self.job.settings.encode
-        steps = self.job.settings.steps
-        return {
-            "version": 1,
-            "target": str(target.resolve()),
-            "srt": str(srt.resolve()),
-            "srt_sha256": _sha256_file(srt),
-            "segments": self._source_snapshot,
-            "cover": _file_stamp(cover),
-            "burn_danmaku": steps.burn_danmaku,
-            "concat": steps.concat,
-            "danmaku_style": asdict(self.job.settings.danmaku),
-            "subtitle_style": asdict(self.job.settings.subtitle),
-            "intermediate_encode": {
-                "encoder": self._encoder, "preset": self._preset,
-                "cq": encode.danmaku_cq, "audio_bitrate": encode.audio_bitrate,
-            },
-            "final_encode": {
-                "encoder": self._encoder, "preset": self._preset,
-                "cq": encode.final_cq,
-            },
-        }
-
-    def _render_record_matches(self, target: Path, record: dict) -> bool:
-        path = self._job_record_path("render", target)
-        return _read_json(path) == record and _media_valid(target)
+        """Compatibility for older pipeline callers; new code uses ArtifactStore."""
+        return self.artifacts.work_record_path(kind, path)
 
     def _check_cancel(self) -> None:
         if self.cancel.is_set():
@@ -229,7 +87,7 @@ class Pipeline:
                    weight: float, sources: list[Path] | None = None,
                    force: bool = False, cwd: Path | None = None) -> Path:
         self._check_cancel()
-        part = _part_path(target)
+        part = part_path(target)
         part.unlink(missing_ok=True)
         if self._reuse_video(target, sources or [], force=force):
             self._finish_unit(weight)
@@ -242,9 +100,9 @@ class Pipeline:
                 cancel=self.cancel, log=self._log, cwd=cwd,
             )
             self._check_cancel()
-            if not _media_valid(part):
+            if not media_valid(part):
                 raise FfmpegError(f"处理结果无法读取或时长为零：{part}")
-            os.replace(part, target)
+            self.artifacts.commit_part(part, target)
         finally:
             part.unlink(missing_ok=True)
         self._finish_unit(weight)
@@ -253,7 +111,7 @@ class Pipeline:
     def _reuse_video(self, target: Path, sources: list[Path], force: bool = False) -> bool:
         if self.job.settings.overwrite or force or not target.exists():
             return False
-        if not _media_valid(target):
+        if not media_valid(target):
             self._log(f"已有文件无效，重新生成：{target}")
             target.unlink(missing_ok=True)
             return False
@@ -371,11 +229,14 @@ class Pipeline:
     def _reuse_wav(self, path: Path, source: Path) -> bool:
         if self.job.settings.overwrite or not path.exists():
             return False
-        if not _wav_valid(path):
+        if not wav_valid(path):
             self._log(f"已有 WAV 无效，重新抽取：{path}")
             path.unlink(missing_ok=True)
             return False
         if source.stat().st_mtime_ns > path.stat().st_mtime_ns:
+            return False
+        if read_json(self.artifacts.work_record_path("wav", path)) != self.artifacts.wav_record(source):
+            self._log("识别音频的时间轴处理已更新，重新抽取音频")
             return False
         self._log(f"复用已抽取音频：{path}")
         return True
@@ -383,20 +244,23 @@ class Pipeline:
     def _extract_wav(self, source: Path, path: Path, duration: float,
                      weight: float) -> None:
         self._check_cancel()
-        part = _part_path(path)
+        part = part_path(path)
         part.unlink(missing_ok=True)
         if self._reuse_wav(path, source):
             self._finish_unit(weight)
             return
         try:
-            run_ffmpeg(["-i", str(source), "-vn", "-ac", "1", "-ar", "16000",
+            run_ffmpeg(["-i", str(source), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+                        "-af", "aresample=async=1000:first_pts=0",
                         "-c:a", "pcm_s16le", str(part)], duration,
                        on_progress=lambda value: self._report(value, weight),
                        cancel=self.cancel, log=self._log)
             self._check_cancel()
-            if not _wav_valid(part):
+            if not wav_valid(part):
                 raise FfmpegError(f"抽出的 WAV 无效：{part}")
-            os.replace(part, path)
+            self.artifacts.commit_part(part, path)
+            write_json_atomic(self.artifacts.work_record_path("wav", path),
+                              self.artifacts.wav_record(source))
         finally:
             part.unlink(missing_ok=True)
         self._finish_unit(weight)
@@ -404,16 +268,22 @@ class Pipeline:
     def _srt(self, source: Path, path: Path, duration: float,
              has_original_audio: bool, weight: float) -> Path:
         self._check_cancel()
-        part = _part_path(path)
+        part = part_path(path)
         part.unlink(missing_ok=True)
         options = self.job.settings.asr
         if path.is_file() and options.reuse_existing_srt and not self.job.settings.overwrite:
-            state = self._srt_record_state(path)
-            if state == "match" or (state == "missing" and not self.job.strict_srt_source):
-                self._log(f"复用已有 SRT（保留手动修改）：{path}")
+            source_state = self.artifacts.srt_source_state(path)
+            state = self.artifacts.srt_reuse_state(path)
+            if source_state == "match" or (source_state == "missing" and not self.job.strict_srt_source):
+                if state == "edited":
+                    self._log(f"复用用户手动修改的 SRT：{path}")
+                else:
+                    self._log(f"复用已有 SRT（按设置保留现有字幕）：{path}")
+                if state in ("stale", "legacy", "missing"):
+                    self._log("已启用“已有同名 .srt 时跳过识别”，本次保留现有字幕；取消该选项后才会按当前识别模型重新生成")
                 self._finish_unit(weight)
                 return path
-            self._log(f"已有 SRT 的来源记录{('缺失' if state == 'missing' else '不匹配')}，重新识别：{path}")
+            self._log(f"已有 SRT 的来源记录{('缺失' if source_state == 'missing' else '不匹配')}，重新识别：{path}")
         self._step(f"语音识别：{source.name}")
         wav = self.work_dir / f"{path.stem}.wav"
         self._intermediates.add(wav)
@@ -424,7 +294,7 @@ class Pipeline:
         else:
             wav_weight = weight * 0.15
             self._extract_wav(source, wav, duration, wav_weight)
-            transcriber = Transcriber(options, log=self._log)
+            transcriber = create_transcriber(options, log=self._log)
             try:
                 cues = transcriber.transcribe(
                     wav, self.job.settings.subtitle.max_chars,
@@ -438,9 +308,9 @@ class Pipeline:
         try:
             write_srt(cues, part)
             self._check_cancel()
-            self._assert_sources_unchanged()
-            os.replace(part, path)
-            self._save_srt_record(path)
+            self.artifacts.assert_sources_unchanged()
+            self.artifacts.commit_part(part, path)
+            self.artifacts.save_srt_record(path)
         finally:
             part.unlink(missing_ok=True)
         self._log(f"字幕已生成：{path}（{len(cues)} 条）")
@@ -454,8 +324,8 @@ class Pipeline:
         cues = read_srt(srt)
         if not cues or any(cue.start < 0 or cue.end <= cue.start for cue in cues):
             raise ValueError(f"字幕文件没有有效字幕或时间范围错误，请先修正 SRT：{srt}")
-        record = self._render_record(target, srt, cover)
-        reuse = not self.job.settings.overwrite and self._render_record_matches(target, record)
+        record = self.artifacts.render_record(target, srt, cover, self._encoder, self._preset)
+        reuse = not self.job.settings.overwrite and self.artifacts.render_record_matches(target, record)
         if reuse:
             self._log(f"字幕及编码设置未变化，复用成片：{target}")
         write_ass(cues, ass, info.width, info.height, self.job.settings.subtitle)
@@ -478,25 +348,13 @@ class Pipeline:
                                  sources=[] if reuse else sources,
                                  force=not reuse, cwd=self._scratch)
         if not reuse:
-            self._assert_sources_unchanged()
-            _write_json(self._job_record_path("render", target), record)
+            self.artifacts.assert_sources_unchanged()
+            write_json_atomic(self.artifacts.job_record_path("render", target), record)
         return result
 
     def _cleanup_intermediates(self, final_paths: list[Path]) -> None:
-        if self.job.settings.keep_intermediate:
-            return
-        protected = {path.resolve() for path in final_paths}
-        for path in sorted(self._intermediates):
-            if path.resolve() in protected:
-                continue
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                self._log(f"无法清理中间文件 {path}：{exc}")
-        try:
-            self.work_dir.rmdir()  # 仅删除空目录；绝不递归删除其它文件
-        except OSError:
-            pass
+        self.artifacts.cleanup(self._intermediates, final_paths,
+                               self.job.settings.keep_intermediate, self._log)
 
     def run(self, cancel: threading.Event) -> list[Path]:
         self.cancel = cancel
@@ -521,7 +379,7 @@ class Pipeline:
                 raise FfmpegError(f"分段没有有效视频/时长：{segment.video}")
             segment.info = info
             infos.append(info)
-        self._source_snapshot = self._snapshot_sources()
+        self.artifacts.capture_sources()
 
         steps = self.job.settings.steps
         paths = [Path(segment.video).resolve() for segment in self.job.segments]
@@ -544,14 +402,14 @@ class Pipeline:
         names = self._segment_names()
         bases = [self.job.output_base] if steps.concat else names
         for base in bases:
-            self._intermediates.add(self._work_record_path("srt", output_dir / f"{base}.srt"))
+            self._intermediates.add(self.artifacts.work_record_path("srt", output_dir / f"{base}.srt"))
 
         if steps.burn_subtitles and not steps.asr and self.job.strict_srt_source:
             for base in bases:
                 srt = output_dir / f"{base}.srt"
                 if not srt.is_file():
                     raise ValueError(f"找不到字幕文件，请先生成字幕：{srt}")
-                if self._srt_record_state(srt) != "match":
+                if self.artifacts.srt_source_state(srt) != "match":
                     raise ValueError(f"字幕来源与当前分段或顺序不匹配，请先重新生成字幕：{srt}")
 
         # 第二阶段已经成功过时，直接复用成片；默认清理后的工作目录不必重编码数小时。
@@ -561,9 +419,9 @@ class Pipeline:
                 cover = next((seg.cover for seg in self.job.segments
                               if seg.cover is not None and seg.cover.is_file()), None)
                 target = output_dir / f"{self.job.output_base}.完整版.mp4"
-                record = self._render_record(target, srt, cover)
-                if self._render_record_matches(target, record):
-                    self._assert_sources_unchanged()
+                record = self.artifacts.render_record(target, srt, cover, self._encoder, self._preset)
+                if self.artifacts.render_record_matches(target, record):
+                    self.artifacts.assert_sources_unchanged()
                     suffix = ".烧录弹幕.GPU.mp4" if steps.burn_danmaku else ".合并准备.mp4"
                     if transcode:
                         self._intermediates.update(self.work_dir / f"{name}{suffix}" for name in names)

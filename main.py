@@ -23,6 +23,11 @@ def _redirect_missing_streams() -> None:
 
 
 def main() -> int:
+    if "--quality-worker" in sys.argv:
+        sys.argv.remove("--quality-worker")
+        from lubo.quality_worker import main as worker_main
+        worker_main()
+        return 0
     _redirect_missing_streams()
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from lubo.gui.main_window import run_app

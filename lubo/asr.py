@@ -8,7 +8,6 @@ import math
 import os
 import sys
 import threading
-import wave
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,22 +16,16 @@ from typing import Any, Callable, Iterator
 from lubo.config import AsrOptions
 from lubo.ffmpeg import Cancelled
 from lubo.subtitles import Cue
+from lubo.wav_audio import SAMPLE_RATE, WavReader
 
 _logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 16000
 VAD_WINDOW_SECONDS = 120.0      # 有界读取；每次只把两分钟音频送入 VAD
 MAX_ASR_CHUNK_SECONDS = 120.0  # 限制单次阻塞推理，取消可在块间生效
 CHUNK_PAD_MS = 300              # 块边界向静音区外扩，避免切掉首尾字
 VAD_PROGRESS_SHARE = 0.1        # VAD 占总进度的比例
 DEFAULT_BATCH_SIZE_S = 120      # 4GB 显存下的保守批大小（秒）
 MIN_BATCH_SIZE_S = 15
-MIN_CUE_SECONDS = 0.2
-SINGLE_CHAR_MERGE_GAP_SECONDS = 1.0
-MAX_MERGED_CUE_SECONDS = 6.0
-
-# 句尾去掉的标点；问号/感叹号/省略号保留，它们对字幕语气有意义
-TRAILING_PUNCT = "，。、,.；;：:　 \t"
 
 
 @dataclass
@@ -91,171 +84,24 @@ def group_segments(segments: list[list[int]], chunk_ms: int, total_ms: int,
     return chunks
 
 
-def strip_trailing_punct(text: str) -> str:
-    return text.strip().rstrip(TRAILING_PUNCT).strip()
-
-
-def _is_latin(ch: str) -> bool:
-    return ch.isascii() and ch.isalnum()
-
-
-def join_tokens(tokens: list[str]) -> str:
-    """中文直接拼接，相邻的英文/数字 token 之间补空格。"""
-    out = ""
-    for tok in tokens:
-        if out and tok and _is_latin(out[-1]) and _is_latin(tok[0]):
-            out += " "
-        out += tok
-    return out
-
-
-def _split_units(units: list[tuple[str, float, float]], max_chars: int) -> list[Cue]:
-    """把 (文本, 开始, 结束) 单元均衡地拼成若干条不超过 max_chars 的 Cue。"""
-    total = len(join_tokens([u[0] for u in units]))
-    pieces = max(1, math.ceil(total / max_chars))
-    target = min(max_chars, math.ceil(total / pieces))
-    cues: list[Cue] = []
-    current: list[tuple[str, float, float]] = []
-    for unit in units:
-        candidate = join_tokens([u[0] for u in current] + [unit[0]])
-        if current and len(candidate) > target:
-            cues.append(Cue(current[0][1], current[-1][2], join_tokens([u[0] for u in current])))
-            current = []
-        current.append(unit)
-    if current:
-        cues.append(Cue(current[0][1], current[-1][2], join_tokens([u[0] for u in current])))
-    return cues
-
-
-def _units_from_sentence(sentence: dict, body: str) -> list[tuple[str, float, float]]:
-    """取字级单元（秒，相对块起点）。token 与时间戳数量不一致时按字数线性分配时间。"""
-    stamps = sentence.get("timestamp") or []
-    raw = sentence.get("raw_text")
-    tokens = raw.split() if isinstance(raw, str) else []
-    if stamps and len(tokens) == len(stamps):
-        return [(tok, float(ts[0]) / 1000, float(ts[1]) / 1000) for tok, ts in zip(tokens, stamps)]
-
-    chars = [c for c in body if not c.isspace()]
-    if not chars:
-        return []
-    start = float(sentence.get("start", 0)) / 1000
-    end = float(sentence.get("end", 0)) / 1000
-    if stamps and len(stamps) == len(chars):
-        return [(c, float(ts[0]) / 1000, float(ts[1]) / 1000) for c, ts in zip(chars, stamps)]
-    step = max(end - start, 0.0) / len(chars)
-    return [(c, start + i * step, start + (i + 1) * step) for i, c in enumerate(chars)]
-
-
-def sentence_to_cues(sentence: dict, max_chars: int, offset: float = 0.0) -> list[Cue]:
-    """把 FunASR 的 sentence_info 条目转换成 Cue（秒，已加 offset），超长时按字级时间戳拆分。"""
-    text = str(sentence.get("text") or "")
-    body = strip_trailing_punct(text)
-    if not body:
-        return []
-    start = float(sentence.get("start", 0)) / 1000
-    end = float(sentence.get("end", 0)) / 1000
-    max_chars = max(1, int(max_chars))
-
-    if len(body) <= max_chars:
-        cues = [Cue(start, end, body)]
-    else:
-        units = _units_from_sentence(sentence, body)
-        cues = _split_units(units, max_chars) if units else [Cue(start, end, body)]
-        tail = text.strip()[len(body):].strip().rstrip(TRAILING_PUNCT)
-        if tail and cues and len(cues[-1].text) + len(tail) <= max_chars:
-            cues[-1].text += tail   # 保留句尾的 ？！
-    return [Cue(c.start + offset, c.end + offset, c.text) for c in cues if c.text.strip()]
-
-
-def finalize_cues(cues: list[Cue], duration: float, max_chars: int = 22) -> list[Cue]:
-    """整理时间轴，并把模型意外切出的孤立单字接回相邻字幕。"""
-    cues = sorted((c for c in cues if c.text.strip()), key=lambda c: (c.start, c.end))
-    out: list[Cue] = []
-    for cue in cues:
-        start = min(max(cue.start, 0.0), duration)
-        end = min(max(cue.end, start + MIN_CUE_SECONDS), duration)
-        if out and start < out[-1].end:
-            if start - out[-1].start >= 0.001:
-                out[-1].end = round(start, 3)
-            else:
-                # 完全相同的起点常是相邻块重识别；保留先出现的一条。
-                start = out[-1].end
-        if end <= start:
-            continue
-        out.append(Cue(round(start, 3), round(end, 3), cue.text.strip()))
-    merged: list[Cue] = []
-    for index, cue in enumerate(out):
-        if len(cue.text) == 1 and index + 1 < len(out):
-            following = out[index + 1]
-            if (following.start - cue.end <= SINGLE_CHAR_MERGE_GAP_SECONDS
-                    and len(cue.text + following.text) <= max_chars
-                    and following.end - cue.start <= MAX_MERGED_CUE_SECONDS):
-                following.start = cue.start
-                following.text = cue.text + following.text
-                continue
-        if len(cue.text) == 1 and merged:
-            previous = merged[-1]
-            if (cue.start - previous.end <= SINGLE_CHAR_MERGE_GAP_SECONDS
-                    and len(previous.text + cue.text) <= max_chars
-                    and cue.end - previous.start <= MAX_MERGED_CUE_SECONDS):
-                previous.end = cue.end
-                previous.text += cue.text
-                continue
-        merged.append(cue)
-    return merged
-
-
-class WavReader:
-    """按时间范围读取 PCM WAV；内存只随 VAD 窗口或识别块增长。"""
-
-    def __init__(self, path: Path):
-        self._wav = wave.open(str(path), "rb")
-        if self._wav.getcomptype() != "NONE" or self._wav.getsampwidth() != 2:
-            self._wav.close()
-            raise ValueError("识别音频必须是 16 位 PCM WAV；请先用 FFmpeg 转换")
-        self.channels = self._wav.getnchannels()
-        self.sample_rate = self._wav.getframerate()
-        self.frames = self._wav.getnframes()
-        if self.channels < 1 or self.sample_rate < 1:
-            self._wav.close()
-            raise ValueError("识别音频的声道数或采样率无效")
-        self.duration = self.frames / self.sample_rate
-        self.total_ms = math.ceil(self.duration * 1000)
-
-    def __enter__(self) -> WavReader:
-        return self
-
-    def __exit__(self, *_exc: Any) -> None:
-        self._wav.close()
-
-    def read_ms(self, start_ms: int, end_ms: int) -> Any:
-        """返回单声道 int16；非 16 kHz 输入也只在当前范围内重采样。"""
-        import numpy as np
-
-        start = min(max(round(start_ms * SAMPLE_RATE / 1000), 0),
-                    round(self.frames * SAMPLE_RATE / self.sample_rate))
-        end = min(max(round(end_ms * SAMPLE_RATE / 1000), start),
-                  round(self.frames * SAMPLE_RATE / self.sample_rate))
-        if end <= start:
-            return np.empty(0, dtype=np.int16)
-
-        source_start = min(self.frames, start * self.sample_rate // SAMPLE_RATE)
-        source_end = min(self.frames,
-                         math.ceil((end - 1) * self.sample_rate / SAMPLE_RATE) + 1)
-        self._wav.setpos(source_start)
-        raw = self._wav.readframes(source_end - source_start)
-        samples = np.frombuffer(raw, dtype="<i2")
-        if self.channels > 1:
-            samples = samples.reshape(-1, self.channels).sum(axis=1, dtype=np.int32)
-            samples = (samples // self.channels).astype(np.int16)
-        if self.sample_rate == SAMPLE_RATE:
-            return np.ascontiguousarray(samples)
-
-        # 输出样本位置按整段音频的绝对时间计算，窗口之间不会累积采样误差。
-        positions = (np.arange(start, end, dtype=np.float64)
-                     * self.sample_rate / SAMPLE_RATE - source_start)
-        interpolated = np.interp(positions, np.arange(len(samples)), samples)
-        return np.rint(interpolated).astype(np.int16)
+from lubo.asr_timing import (
+    MIN_CUE_SECONDS,
+    SENTENCE_PAUSE_SECONDS,
+    SENTENCE_PUNCT,
+    TRAILING_PUNCT,
+    _is_latin,
+    _split_clause,
+    _split_units,
+    _spoken_text,
+    _units_from_sentence,
+    finalize_cues,
+    join_tokens,
+    sentence_to_cues,
+    spoken_text,
+    split_timed_units,
+    strip_trailing_punct,
+    units_from_sentence,
+)
 
 
 def _to_float(samples: Any) -> Any:

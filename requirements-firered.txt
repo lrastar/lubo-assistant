@@ -1,0 +1,20 @@
+# CPU-only Windows runtime. 2.9.1 still exposes forced_align in the tested
+# win_amd64 wheel (deprecated upstream); the worker uses that path when present.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.9.1+cpu
+torchaudio==2.9.1+cpu
+
+# FireRedASR2S runtime imports its AED, LID/VAD/Punc package modules at package
+# initialization, so keep the upstream declared runtime dependencies pinned.
+transformers==5.1.0
+numpy==2.4.2
+cn2an==0.5.23
+kaldiio==2.18.1
+kaldi-native-fbank==1.22.3
+sentencepiece==0.2.1
+soundfile==0.13.1
+textgrid==1.6.1
+
+# Pinned local model download support; not used for inference after setup.
+huggingface-hub==1.3.0
+hf-xet==1.2.0
